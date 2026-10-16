@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><style>
+@font-face {
+  font-family: "Optimistic";
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url("/fonts/OptimisticAI_VF_Optimized.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Optimistic Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/OptimisticMono_W_TextRegular.woff2") format("woff2");
+}
+:where(html) {
+  font-family: "Optimistic", system-ui, sans-serif;
+}
+:where(code, pre, kbd, samp) {
+  font-family: "Optimistic Mono", ui-monospace, monospace;
+}
+</style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>CaelcoinV3</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script type="importmap">
+{"imports":{"@supabase/supabase-js":"https://esm.sh/@supabase/supabase-js@2.39.7"}}
+</script>
+<style>
+body{background:#f5f5f7;font-family:-apple-system,BlinkMacSystemFont,sans-serif}
+.card{background:white;border-radius:20px;box-shadow:0 1px 3px rgba(0,0,0,0.06);border:1px solid rgba(0,0,0,0.04)}
+</style>
+</head>
+<body class="min-h-screen p-4 max-w-[430px] mx-auto">
+<div id="root"></div>
+<script type="module">
+import { createClient } from '@supabase/supabase-js';
+const SUPABASE_URL="https://cfdfwyensbzhvtxndleb.supabase.co";
+const SUPABASE_KEY="sb_publishable_K_YyDQ1heCrxgNlHGtGUNw_PKAJVE9n";
+const supabase=createClient(SUPABASE_URL,SUPABASE_KEY);
+const ADMIN_HASH="9de053625930a4f58ca45ccc7da183fb9cd17544f78f7aa8979222e7470bab8f";
+async function hashPwd(p){
+  const b=await crypto.subtle.digest('SHA-256', new TextEncoder().encode(p));
+  return Array.from(new Uint8Array(b)).map(x=>x.toString(16).padStart(2,'0')).join('');
+}
+let S={
+  view:'login', user:null, isAdmin:false,
+  nick:'', pass:'', adminPin:'', showPass:false, showAdmin:false,
+  err:'', loading:false,
+  price:1.0, hist:[1.0], players:[], reqs:[], 
+  buy:10, sell:10, sendTo:'', sendAmt:10, reqAmt:100,
+  showSend:false, showReq:false
+};
+async function loadMeta(){
+  let {data} = await supabase.from('game_meta').select('*').eq('id',1).maybeSingle();
+  if(!data){
+    const ins = await supabase.from('game_meta').insert({id:1, price:1.0, price_history:[1.0], total_minted:0, total_burned:0}).select().single();
+    data=ins.data;
+  }
+  if(data){ S.price=Number(data.price); S.hist=data.price_history||[1.0]; }
+  draw();
+}
+async function loadPlayers(){
+  const {data} = await supabase.from('players').select('*').order('points',{ascending:false}).limit(100);
+  if(data) S.players=data;
+  draw();
+}
+async function loadReqs(){
+  const {data} = await supabase.from('requests').select('*').eq('status','pending').order('created_at',{ascending:false});
+  if(data) S.reqs=data;
+  draw();
+}
+async function login(){
+  S.err=''; S.loading=true; draw();
+  try{
+    const nick=S.nick.trim().toLowerCase();
+    if(!nick) throw new Error('Enter nickname');
+    if(!S.pass) throw new Error('Enter password - this protects your account');
+    const ph=await hashPwd(S.pass);
+    let {data:ex, error} = await supabase.from('players').select('*').eq('nickname',nick).maybeSingle();
+    if(error && error.code!=='PGRST116') throw error;
+    if(!ex){
+      const {data:cr, error:ie} = await supabase.from('players').insert({nickname:nick, password_hash:ph, points:0, caelcoin:0, txs:[]}).select().single();
+      if(ie) throw ie;
+      ex=cr;
+    } else {
+      if(!ex.password_hash){
+        await supabase.from('players').update({password_hash:ph}).eq('nickname',nick);
+        ex.password_hash=ph;
+      } else if(ex.password_hash!==ph){
+        throw new Error('Wrong password. Account is protected - friends cannot login as you.');
+      }
+    }
+    let isAdmin=false;
+    if(S.showAdmin && S.adminPin){
+      const ah=await hashPwd(S.adminPin);
+      if(ah===ADMIN_HASH) isAdmin=true;
+      else throw new Error('Wrong admin PIN');
+    }
+    S.user=ex; S.isAdmin=isAdmin; S.view='app'; S.loading=false; S.err='';
+    draw();
+    loadMeta(); loadPlayers(); loadReqs();
+    supabase.channel('live').on('postgres_changes',{event:'*',schema:'public',table:'players'},async()=>{
+      loadPlayers();
+      const {data} = await supabase.from('players').select('*').eq('nickname',S.user.nickname).single();
+      if(data){ S.user=data; draw(); }
+    }).on('postgres_changes',{event:'*',schema:'public',table:'game_meta'},()=>loadMeta()).on('postgres_changes',{event:'*',schema:'public',table:'requests'},()=>loadReqs()).subscribe();
+  }catch(e){ S.err=e.message; S.loading=false; draw(); }
+}
+async function buy(){
+  const amt=Number(S.buy); if(!amt) return;
+  const cost=amt*S.price;
+  if(S.user.points < cost){ S.err='Need '+cost.toFixed(2)+' points'; draw(); return; }
+  const np=Number(S.user.points)-cost; const nc=Number(S.user.caelcoin)+amt;
+  const txs=[...(S.user.txs||[]),{type:'BUY',amt,price:S.price,t:new Date().toISOString()}].slice(-50);
+  const {error} = await supabase.from('players').update({points:np, caelcoin:nc, txs}).eq('nickname',S.user.nickname);
+  if(error){ S.err=error.message; draw(); return; }
+  const pump=Math.min(0.05, amt/500);
+  const nprice=S.price*(1+pump);
+  await supabase.from('game_meta').update({price:nprice, price_history:[...S.hist, nprice].slice(-40)}).eq('id',1);
+  S.user.points=np; S.user.caelcoin=nc; S.err='Bought '+amt+' - price pumped!'; draw();
+}
+async function sell(){
+  const amt=Number(S.sell); if(!amt) return;
+  if(S.user.caelcoin < amt){ S.err='Not enough Caelcoin'; draw(); return; }
+  const gain=amt*S.price;
+  const np=Number(S.user.points)+gain; const nc=Number(S.user.caelcoin)-amt;
+  const txs=[...(S.user.txs||[]),{type:'SELL',amt,price:S.price,t:new Date().toISOString()}].slice(-50);
+  await supabase.from('players').update({points:np, caelcoin:nc, txs}).eq('nickname',S.user.nickname);
+  const dump=Math.min(0.05, amt/500);
+  const nprice=S.price*(1-dump);
+  await supabase.from('game_meta').update({price:nprice, price_history:[...S.hist, nprice].slice(-40)}).eq('id',1);
+  S.user.points=np; S.user.caelcoin=nc; S.err='Sold '+amt+' - price dumped'; draw();
+}
+async function requestPoints(){
+  const amt=Number(S.reqAmt); if(!amt) return;
+  await supabase.from('requests').insert({from_nick:S.user.nickname, amount:amt, status:'pending'});
+  S.err='Requested '+amt+' pts - ask admin to approve'; S.showReq=false; draw();
+}
+async function sendPoints(){
+  const to=S.sendTo.trim().toLowerCase(); const amt=Number(S.sendAmt);
+  if(!to||!amt) return;
+  if(S.user.points < amt){ S.err='Not enough points'; draw(); return; }
+  const {data:target} = await supabase.from('players').select('*').eq('nickname',to).maybeSingle();
+  if(!target){ S.err='User not found'; draw(); return; }
+  await supabase.from('players').update({points:Number(S.user.points)-amt}).eq('nickname',S.user.nickname);
+  await supabase.from('players').update({points:Number(target.points)+amt}).eq('nickname',to);
+  S.user.points-=amt; S.err='Sent '+amt+' to '+to; S.showSend=false; draw();
+}
+async function approve(r){
+  const {data:p} = await supabase.from('players').select('*').eq('nickname',r.from_nick).single();
+  if(p){
+    await supabase.from('players').update({points:Number(p.points)+Number(r.amount)}).eq('nickname',r.from_nick);
+    await supabase.from('requests').update({status:'approved'}).eq('id',r.id);
+    loadReqs(); loadPlayers();
+  }
+}
+async function deny(r){ await supabase.from('requests').update({status:'denied'}).eq('id',r.id); loadReqs(); }
+function draw(){
+  const R=document.getElementById('root');
+  const totalVal = S.user ? Number(S.user.points) + Number(S.user.caelcoin)*S.price : 0;
+  R.innerHTML = S.view==='login' ? `
+    <div class="flex justify-between items-center mb-6 mt-2">
+      <div class="flex items-center gap-2"><div class="w-9 h-9 bg-black rounded-xl flex items-center justify-center text-white font-bold text-sm">C3</div><div><div class="font-bold leading-none">CaelcoinV3</div><div class="text-[10px] tracking-[0.2em] text-gray-400">INTER-PHONE LIVE</div></div></div>
+      <div class="flex items-center gap-1.5 px-3 py-1 bg-white rounded-full border text-[11px]"><div class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>LIVE</div>
+    </div>
+    <div class="card p-6">
+      <h1 class="text-[34px] font-bold leading-[0.9] tracking-tight">Start at 0.<br>No free bags.</h1>
+      <p class="text-sm text-gray-500 mt-3">Password protected. Friends can't steal. Works on all phones.</p>
+      <div class="mt-8">
+        <div class="text-[11px] tracking-widest text-gray-500 mb-2">NICKNAME *</div>
+        <input value="${S.nick}" oninput="S.nick=this.value; draw();" placeholder="e.g. jake" class="w-full bg-gray-50 border border-gray-200 rounded-2xl px-4 py-3.5 outline-none focus:border-black focus:bg-white">
+        <div class="flex justify-between items-center mt-5 mb-2"><div class="text-[11px] tracking-widest text-gray-500">PASSWORD *</div><button onclick="S.showPass=!S.showPass; draw();" class="text-[11px] underline">${S.showPass?'Hide':'Show'}</button></div>
+        <input value="${S.pass}" oninput="S.pass=this.value; draw();" type="${S.showPass?'text':'password'}" placeholder="Protects your account" class="w-full bg-gray-50 border border-gray-200 rounded-2xl px-4 py-3.5 outline-none focus:border-black focus:bg-white">
+        <label class="flex items-center gap-2 mt-5 cursor-pointer"><input type="checkbox" ${S.showAdmin?'checked':''} onchange="S.showAdmin=this.checked; draw();" class="w-4 h-4 rounded"><span class="text-[11px] tracking-widest">ADMIN?</span></label>
+        ${S.showAdmin?`<input value="${S.adminPin}" oninput="S.adminPin=this.value; draw();" type="password" placeholder="Admin PIN" class="w-full mt-3 bg-gray-50 border border-gray-200 rounded-2xl px-4 py-3.5 outline-none">`:''}
+        <button onclick="login()" class="w-full mt-6 bg-black text-white rounded-2xl py-4 font-bold tracking-widest text-sm">${S.loading?'CONNECTING...':'CREATE / LOGIN - START AT 0'}</button>
+        ${S.err?`<div class="mt-4 text-sm text-red-600 bg-red-50 p-3 rounded-2xl border border-red-100">${S.err}</div>`:''}
+        <div class="mt-4 flex gap-2"><div class="text-[10px] px-2.5 py-1 bg-green-50 text-green-700 rounded-full border">Supabase Live</div><div class="text-[10px] px-2.5 py-1 bg-blue-50 text-blue-700 rounded-full border">Password Secured</div></div>
+      </div>
+    </div>
+  ` : `
+    <div class="flex justify-between items-center mb-4 mt-1">
+      <div class="flex items-center gap-2"><div class="w-8 h-8 bg-black rounded-xl flex items-center justify-center text-white font-bold text-xs">C3</div><span class="font-bold text-sm">CaelcoinV3</span><span class="text-[10px] px-2 py-1 bg-green-50 text-green-600 rounded-full border">LIVE - ${S.players.length} online</span></div>
+      <button onclick="S.view='login'; S.user=null; S.isAdmin=false; S.nick=''; S.pass=''; draw();" class="text-[11px] border bg-white px-3 py-1.5 rounded-full">Logout</button>
+    </div>
+    <div class="card p-5 mb-3">
+      <div class="flex justify-between"><span class="text-[11px] tracking-widest text-gray-400">@${S.user.nickname.toUpperCase()}</span><span class="text-[10px] px-2 py-1 ${S.isAdmin?'bg-black text-white':'bg-gray-100'} rounded-full">${S.isAdmin?'ADMIN':'PLAYER'}</span></div>
+      <div class="grid grid-cols-2 mt-4 gap-4">
+        <div><div class="text-[11px] tracking-widest text-gray-400">POINTS</div><div class="text-[32px] font-bold tracking-tight">${Math.floor(S.user.points).toLocaleString()}</div><div class="text-[11px] text-gray-400">Play money</div></div>
+        <div><div class="text-[11px] tracking-widest text-gray-400">CAELCOIN</div><div class="text-[32px] font-bold tracking-tight">${Number(S.user.caelcoin).toFixed(2)}</div><div class="text-[11px] text-gray-400">~ $${(Number(S.user.caelcoin)*S.price).toFixed(2)}</div></div>
+      </div>
+      <div class="mt-4 pt-4 border-t flex justify-between items-center"><span class="text-[11px] text-gray-400">TOTAL VALUE</span><span class="font-bold">$${totalVal.toFixed(2)}</span></div>
+      ${Number(S.user.points)===0 && Number(S.user.caelcoin)===0?'<div class="mt-3 text-[12px] bg-blue-50 text-blue-700 p-2.5 rounded-xl">Fresh account! Request points from admin to start trading.</div>':''}
+    </div>
+    <div class="card p-5 mb-3">
+      <div class="flex justify-between items-center"><span class="text-[11px] tracking-widest text-gray-400">CAELCOIN PRICE</span><span class="text-[10px] px-2 py-1 bg-gray-900 text-white rounded-full">FLUCTUATING LIVE</span></div>
+      <div class="text-[36px] font-bold mt-1 tracking-tight">$${S.price.toFixed(4)}</div>
+      <div class="h-[40px] flex items-end gap-[2px] mt-3">${S.hist.slice(-40).map(p=>{const h=Math.max(4, Math.min(40, (p/Math.max(...S.hist))*30)); return `<div style="height:${h}px" class="flex-1 bg-black rounded-full"></div>`}).join('')}</div>
+      <div class="grid grid-cols-2 gap-3 mt-5">
+        <div class="bg-gray-50 rounded-2xl p-3"><div class="text-[11px] tracking-widest text-gray-400">BUY</div><input type="number" value="${S.buy}" oninput="S.buy=this.value" class="w-full mt-2 bg-white border rounded-full px-3 py-2 text-sm outline-none"><button onclick="buy()" class="w-full mt-2 bg-black text-white rounded-full py-2.5 text-sm font-semibold">Buy</button><div class="text-[10px] text-gray-400 mt-1 text-center">Pumps price</div></div>
+        <div class="bg-gray-50 rounded-2xl p-3"><div class="text-[11px] tracking-widest text-gray-400">SELL</div><input type="number" value="${S.sell}" oninput="S.sell=this.value" class="w-full mt-2 bg-white border rounded-full px-3 py-2 text-sm outline-none"><button onclick="sell()" class="w-full mt-2 bg-white border text-black rounded-full py-2.5 text-sm font-semibold">Sell</button><div class="text-[10px] text-gray-400 mt-1 text-center">Dumps price</div></div>
+      </div>
+      ${S.err?`<div class="mt-3 text-xs bg-amber-50 text-amber-800 p-2.5 rounded-xl border">${S.err}</div>`:''}
+    </div>
+    <div class="grid grid-cols-2 gap-3 mb-3">
+      <button onclick="S.showReq=!S.showReq; S.showSend=false; draw();" class="card p-4 text-left"><div class="text-[11px] tracking-widest text-gray-400">REQUEST</div><div class="font-semibold text-sm mt-1">Get Points</div></button>
+      <button onclick="S.showSend=!S.showSend; S.showReq=false; draw();" class="card p-4 text-left"><div class="text-[11px] tracking-widest text-gray-400">SEND</div><div class="font-semibold text-sm mt-1">Send Points</div></button>
+    </div>
+    ${S.showReq?`<div class="card p-4 mb-3"><div class="text-sm font-semibold">Request Points</div><input type="number" value="${S.reqAmt}" oninput="S.reqAmt=this.value" class="w-full mt-3 border rounded-full px-4 py-2.5"><button onclick="requestPoints()" class="w-full mt-2 bg-black text-white rounded-full py-2.5 text-sm">Request ${S.reqAmt}</button></div>`:''}
+    ${S.showSend?`<div class="card p-4 mb-3"><div class="text-sm font-semibold">Send to Friend</div><input value="${S.sendTo}" oninput="S.sendTo=this.value" placeholder="nickname" class="w-full mt-3 border rounded-full px-4 py-2.5"><input type="number" value="${S.sendAmt}" oninput="S.sendAmt=this.value" class="w-full mt-2 border rounded-full px-4 py-2.5"><button onclick="sendPoints()" class="w-full mt-2 bg-black text-white rounded-full py-2.5 text-sm">Send</button><div class="text-[10px] text-gray-400 mt-2">Protected by password - can't steal with username alone</div></div>`:''}
+    ${S.isAdmin?`
+    <div class="card p-5 border-2 border-black">
+      <div class="font-bold">Central Bank - Admin</div>
+      <div class="text-[11px] text-gray-400 mt-1">${S.reqs.length} pending</div>
+      <div class="mt-4">${S.reqs.map(r=>`<div class="flex justify-between items-center py-2.5 border-b"><div><div class="text-sm font-medium">${r.from_nick}</div><div class="text-[11px] text-gray-400">Wants ${r.amount}</div></div><div class="flex gap-1.5"><button onclick='approve(${JSON.stringify(r).replace(/'/g,"&#39;")})' class="bg-black text-white px-3 py-1.5 rounded-full text-xs">Approve</button><button onclick='deny(${JSON.stringify(r).replace(/'/g,"&#39;")})' class="bg-white border px-3 py-1.5 rounded-full text-xs">Deny</button></div></div>`).join('')||'<div class="text-xs text-gray-400 py-4">No requests</div>'}</div>
+      <div class="mt-4 text-[11px] tracking-widest">PLAYERS</div>
+      <div class="mt-2">${S.players.map(p=>`<div class="flex justify-between text-xs py-1"><span>${p.nickname}</span><span>${p.points}pts</span></div>`).join('')}</div>
+    </div>`:''}
+  `;
+}
+draw();
+loadMeta();
+</script>
+<script>(function(){var loc=location.href.replace(/#.*$/,"");var ATTR_NAMES=["data-product-id","data-productid","data-product_id","product-id","productid","product_id","data-source-entity-id","source-entity-id","source_entity_id","data-product","data-metadata","data-meta"];var DATASET_KEYS=["productId","productid","product_id","sourceEntityId","sourceentityid","source_entity_id","product","metadata","meta"];function readProductId(value){if(typeof value!=="string"||value.length===0)return null;if(/^[0-9]{6,}$/.test(value))return value;var match=value.match(/(?:product(?:_|-)?id|source(?:_|-)?entity(?:_|-)?id)["'=:\s]+([0-9]{6,})/i);return match?match[1]:null}function extractProductId(start){for(var node=start;node&&node!==document.body;node=node.parentElement){for(var i=0;i<ATTR_NAMES.length;i++){var attrValue=node.getAttribute&&node.getAttribute(ATTR_NAMES[i]);var attrProductId=readProductId(attrValue);if(attrProductId)return attrProductId}var dataset=node.dataset||null;if(dataset){for(var j=0;j<DATASET_KEYS.length;j++){var dataValue=dataset[DATASET_KEYS[j]];var dataProductId=readProductId(dataValue);if(dataProductId)return dataProductId}}}return null}function isInlineMediaSlotElement(node){return !!(node&&node.getAttribute&&node.getAttribute("data-clippy-inline-media-slot")!==null)}function findInlineMediaSlot(start){for(var node=start;node&&node!==document.body;node=node.parentElement){if(isInlineMediaSlotElement(node))return node}return null}function readInlineMediaUrl(node){if(!node)return null;return node.getAttribute&&((node.getAttribute("data-clippy-inline-media-url")||node.getAttribute("data-url")||node.getAttribute("data_url")))||node.href||null}function stripHash(url){return String(url).replace(/#.*$/,"")}function urlsMatch(a,b){if(!a||!b)return false;try{return stripHash(new URL(a,loc).href)===stripHash(new URL(b,loc).href)}catch(_){return stripHash(a)===stripHash(b)}}function isFirstPartyReelUrl(value){try{var url=new URL(value,loc);if(url.protocol!=="https:")return false;var host=url.hostname.toLowerCase();var supported=host==="instagram.com"||host.endsWith(".instagram.com")||host==="facebook.com"||host.endsWith(".facebook.com");return supported&&/\/reels?\//i.test(url.pathname)}catch(_){return false}}function isInlineMediaUrlClick(node,href){var slot=findInlineMediaSlot(node);if(!slot)return false;var slotUrl=readInlineMediaUrl(slot);if(slotUrl)return urlsMatch(href,slotUrl);return isFirstPartyReelUrl(href)}function findDataHref(start){for(var node=start;node&&node!==document.body;node=node.parentElement){if(node.getAttribute){var href=node.getAttribute("data-href")||node.getAttribute("data-url");if(href)return{href:href,node:node}}}return null}var nativeOpen=window.open;window.open=function(url){if(parent!==window&&typeof url==="string"&&/^https?:\/\//.test(url)){parent.postMessage({type:"ecto:usercontent-link-click",href:url},"*");return null}return nativeOpen?nativeOpen.apply(window,arguments):null};document.addEventListener("click",function(e){var target=e.target instanceof Element?e.target:null;if(!target)return;if(parent===window)return;var a=target.closest?target.closest("a[href]"):null;if(a&&a.href&&/^https?:\/\//.test(a.href)&&a.href.replace(/#.*$/,"")!==loc){if(isInlineMediaUrlClick(a,a.href))return;var productId=extractProductId(target)||extractProductId(a);if(productId){e.preventDefault();parent.postMessage({type:"ecto-artifact-link-click",productId:productId},"*");return}e.preventDefault();parent.postMessage({type:"ecto:usercontent-link-click",href:a.href},"*");return}var dataHref=findDataHref(target);if(dataHref&&/^https?:\/\//.test(dataHref.href)&&dataHref.href.replace(/#.*$/,"")!==loc){if(isInlineMediaUrlClick(dataHref.node,dataHref.href))return;e.preventDefault();parent.postMessage({type:"ecto:usercontent-link-click",href:dataHref.href},"*")}},true)})();</script><script>(function(){var FOCUS_TYPE="ecto:artifact-focus-request";var CLOSE_TYPE="ecto:artifact-close-request";function focusArtifactDocument(){var body=document.body;if(!body)return;try{window.focus();}catch(e){}if(!body.hasAttribute("tabindex"))body.setAttribute("tabindex","-1");try{body.focus({preventScroll:true});}catch(e){try{body.focus();}catch(e2){}}}window.addEventListener("message",function(event){if(event.source!==window.parent)return;var data=event.data;if(!data||typeof data!=="object"||data.type!==FOCUS_TYPE)return;if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",focusArtifactDocument,{once:true});return;}focusArtifactDocument();});window.addEventListener("keydown",function(event){if(event.key!=="Escape")return;window.setTimeout(function(){if(event.defaultPrevented)return;window.parent.postMessage({type:CLOSE_TYPE},"*");},0);});})();</script></body>
+</html>
